@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Generate or edit images with an Azure OpenAI gpt-image-2 deployment.
+Generate or edit images with OpenAI-compatible or Azure OpenAI gpt-image-2 APIs.
 
-The script uses only the Python standard library. Configure the Azure endpoint
-and deployment with environment variables or CLI arguments.
+The script uses only the Python standard library. In auto mode it tries an
+OpenAI-compatible /v1 Images API first, then falls back to Azure OpenAI when
+Azure credentials and endpoint settings are configured.
 """
 
 from __future__ import annotations
@@ -18,19 +19,28 @@ import sys
 import urllib.error
 import urllib.request
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 
 DEFAULT_API_VERSION = "2025-04-01-preview"
 DEFAULT_DEPLOYMENT = "gpt-image-2"
+DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_OPENAI_IMAGE_MODEL = "gpt-image-2"
 MIN_EDIT_API_VERSION = (2025, 4, 1)
 OUTPUT_FORMATS = {"png", "jpeg", "webp"}
 QUALITY_OPTIONS = {"low", "medium", "high", "auto"}
 BACKGROUND_OPTIONS = {"opaque", "auto", "transparent"}
 COMMANDS = {"generate", "edit"}
+PROVIDER_AUTO = "auto"
+PROVIDER_OPENAI = "openai"
+PROVIDER_AZURE = "azure"
+PROVIDER_OPTIONS = {PROVIDER_AUTO, PROVIDER_OPENAI, PROVIDER_AZURE}
 AZURE_API_KEY_ENV = "AZURE_OPENAI_API_KEY"
 LEGACY_AZURE_API_KEY_ENV = "AZURE_API_KEY"
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
+OPENAI_BASE_URL_ENV = "OPENAI_BASE_URL"
+OPENAI_IMAGE_MODEL_ENV = "OPENAI_IMAGE_MODEL"
 AZURE_ENDPOINT_ROOT_ENV = "AZURE_OPENAI_ENDPOINT_ROOT"
 AZURE_ENDPOINT_ENV = "AZURE_OPENAI_ENDPOINT"
 AZURE_DEPLOYMENT_ENV = "AZURE_OPENAI_DEPLOYMENT"
@@ -47,6 +57,22 @@ def inject_default_command(argv: list[str]) -> list[str]:
 
 def default_api_version() -> str:
     return os.getenv(AZURE_API_VERSION_ENV, DEFAULT_API_VERSION)
+
+
+def provider_label(provider: str) -> str:
+    if provider == PROVIDER_OPENAI:
+        return "OpenAI-compatible"
+    if provider == PROVIDER_AZURE:
+        return "Azure OpenAI"
+    return provider
+
+
+def resolve_openai_base_url(args: argparse.Namespace) -> str:
+    return args.base_url or os.getenv(OPENAI_BASE_URL_ENV, DEFAULT_OPENAI_BASE_URL)
+
+
+def resolve_openai_model(args: argparse.Namespace) -> str:
+    return args.model or os.getenv(OPENAI_IMAGE_MODEL_ENV, DEFAULT_OPENAI_IMAGE_MODEL)
 
 
 def endpoint_root_from_parts(endpoint: str, deployment: str) -> str:
@@ -72,13 +98,101 @@ def resolve_endpoint_root(args: argparse.Namespace) -> str:
     )
 
 
+def has_openai_config(args: argparse.Namespace) -> bool:
+    return bool(os.getenv(OPENAI_API_KEY_ENV))
+
+
+def has_openai_dry_run_config(args: argparse.Namespace) -> bool:
+    return bool(
+        has_openai_config(args)
+        or args.base_url
+        or os.getenv(OPENAI_BASE_URL_ENV)
+    )
+
+
+def has_azure_key_config(args: argparse.Namespace) -> bool:
+    return bool(
+        os.getenv(AZURE_API_KEY_ENV)
+        or os.getenv(LEGACY_AZURE_API_KEY_ENV)
+    )
+
+
+def has_azure_endpoint_config(args: argparse.Namespace) -> bool:
+    return bool(
+        args.endpoint_root
+        or os.getenv(AZURE_ENDPOINT_ROOT_ENV)
+        or os.getenv(AZURE_ENDPOINT_ENV)
+    )
+
+
+def has_azure_config(args: argparse.Namespace) -> bool:
+    return has_azure_key_config(args) and has_azure_endpoint_config(args)
+
+
+def select_providers(args: argparse.Namespace, for_dry_run: bool = False) -> list[str]:
+    if args.provider != PROVIDER_AUTO:
+        return [args.provider]
+
+    providers: list[str] = []
+    if for_dry_run:
+        if has_openai_dry_run_config(args):
+            providers.append(PROVIDER_OPENAI)
+        if has_azure_endpoint_config(args):
+            providers.append(PROVIDER_AZURE)
+    else:
+        if has_openai_config(args):
+            providers.append(PROVIDER_OPENAI)
+        if has_azure_config(args):
+            providers.append(PROVIDER_AZURE)
+    if providers:
+        return providers
+
+    if for_dry_run:
+        raise ValueError(
+            "No image API provider is configured for dry-run. Set OPENAI_BASE_URL "
+            "or OPENAI_API_KEY for an OpenAI-compatible /v1 API, or set "
+            "AZURE_OPENAI_ENDPOINT_ROOT or AZURE_OPENAI_ENDPOINT."
+        )
+
+    raise ValueError(
+        "No image API provider is configured. Set OPENAI_API_KEY for an "
+        "OpenAI-compatible /v1 API, or set AZURE_OPENAI_API_KEY with "
+        "AZURE_OPENAI_ENDPOINT_ROOT or AZURE_OPENAI_ENDPOINT."
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Generate or edit images with an Azure OpenAI gpt-image-2 deployment."
+        description=(
+            "Generate or edit images with OpenAI-compatible or Azure OpenAI "
+            "gpt-image-2 APIs."
+        )
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--provider",
+        default=PROVIDER_AUTO,
+        choices=sorted(PROVIDER_OPTIONS),
+        help="API provider. auto tries OpenAI-compatible first, then Azure OpenAI.",
+    )
+    common.add_argument(
+        "--base-url",
+        default=None,
+        help=(
+            "OpenAI-compatible /v1 base URL. Defaults to OPENAI_BASE_URL "
+            "or api.openai.com."
+        ),
+    )
+    common.add_argument(
+        "--model",
+        default=None,
+        help=(
+            "OpenAI-compatible image model. Defaults to OPENAI_IMAGE_MODEL "
+            "or gpt-image-2."
+        ),
+    )
     common.add_argument(
         "--endpoint-root",
         default=None,
@@ -95,7 +209,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     common.add_argument(
         "--api-key",
-        help="Override AZURE_API_KEY for this call.",
+        help="Override the selected provider API key for this call.",
     )
     common.add_argument(
         "--timeout",
@@ -290,7 +404,7 @@ def build_output_paths(base_path: Path, output_format: str, count: int) -> list[
     return [parent / f"{stem}-{index}{suffix}" for index in range(1, count + 1)]
 
 
-def generation_payload(prompt: str, args: argparse.Namespace) -> dict:
+def generation_payload(prompt: str, args: argparse.Namespace, provider: str) -> dict:
     payload = {
         "prompt": prompt,
         "size": args.size,
@@ -298,6 +412,8 @@ def generation_payload(prompt: str, args: argparse.Namespace) -> dict:
         "output_format": args.output_format,
         "n": args.n,
     }
+    if provider == PROVIDER_OPENAI:
+        payload["model"] = resolve_openai_model(args)
     if args.background != "auto":
         payload["background"] = args.background
     if args.output_compression is not None:
@@ -305,10 +421,20 @@ def generation_payload(prompt: str, args: argparse.Namespace) -> dict:
     return payload
 
 
-def edit_fields(prompt: str, args: argparse.Namespace) -> tuple[list[tuple[str, str]], list[tuple[str, Path]]]:
+def edit_fields(
+    prompt: str,
+    args: argparse.Namespace,
+    provider: str,
+) -> tuple[list[tuple[str, str]], list[tuple[str, Path]]]:
     fields: list[tuple[str, str]] = [("prompt", prompt)]
-    files: list[tuple[str, Path]] = [("image", image_path) for image_path in args.image]
+    image_field = "image[]" if provider == PROVIDER_OPENAI else "image"
+    files: list[tuple[str, Path]] = [
+        (image_field, image_path)
+        for image_path in args.image
+    ]
 
+    if provider == PROVIDER_OPENAI:
+        fields.append(("model", resolve_openai_model(args)))
     if args.mask is not None:
         files.append(("mask", args.mask))
     if args.size != "1024x1024":
@@ -330,7 +456,30 @@ def build_url(endpoint_root: str, operation: str, api_version: str) -> str:
     return f"{endpoint_root.rstrip('/')}/images/{operation}?api-version={api_version}"
 
 
-def json_request(url: str, payload: dict, api_key: str, timeout: int) -> dict:
+def build_openai_url(base_url: str, operation: str) -> str:
+    return f"{base_url.rstrip('/')}/images/{operation}"
+
+
+def build_provider_url(provider: str, args: argparse.Namespace, operation: str) -> str:
+    if provider == PROVIDER_OPENAI:
+        return build_openai_url(resolve_openai_base_url(args), operation)
+    endpoint_root = resolve_endpoint_root(args)
+    return build_url(endpoint_root, operation, args.api_version)
+
+
+class ProviderRequestError(Exception):
+    def __init__(self, provider: str, message: str) -> None:
+        super().__init__(message)
+        self.provider = provider
+
+
+def json_request(
+    provider: str,
+    url: str,
+    payload: dict,
+    api_key: str,
+    timeout: int,
+) -> dict:
     body = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         url,
@@ -341,11 +490,28 @@ def json_request(url: str, payload: dict, api_key: str, timeout: int) -> dict:
             "Content-Type": "application/json",
         },
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        raise ProviderRequestError(
+            provider,
+            format_http_error(provider, error),
+        ) from error
+    except urllib.error.URLError as error:
+        raise ProviderRequestError(
+            provider,
+            f"{provider_label(provider)} request failed: {error.reason}",
+        ) from error
+    except Exception as exc:
+        raise ProviderRequestError(
+            provider,
+            f"{provider_label(provider)} request failed: {exc}",
+        ) from exc
 
 
 def multipart_request(
+    provider: str,
     url: str,
     fields: list[tuple[str, str]],
     files: list[tuple[str, Path]],
@@ -363,8 +529,24 @@ def multipart_request(
             "Content-Type": f"multipart/form-data; boundary={boundary}",
         },
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        raise ProviderRequestError(
+            provider,
+            format_http_error(provider, error),
+        ) from error
+    except urllib.error.URLError as error:
+        raise ProviderRequestError(
+            provider,
+            f"{provider_label(provider)} request failed: {error.reason}",
+        ) from error
+    except Exception as exc:
+        raise ProviderRequestError(
+            provider,
+            f"{provider_label(provider)} request failed: {exc}",
+        ) from exc
 
 
 def build_multipart_body(
@@ -424,6 +606,20 @@ def save_images(response: dict, output_paths: list[Path]) -> list[Path]:
     return saved_paths
 
 
+def save_provider_images(
+    provider: str,
+    response: dict,
+    output_paths: list[Path],
+) -> list[Path]:
+    try:
+        return save_images(response, output_paths)
+    except ValueError as exc:
+        raise ProviderRequestError(
+            provider,
+            f"{provider_label(provider)} response failed: {exc}",
+        ) from exc
+
+
 def save_response_json(path: Path | None, response: dict) -> None:
     if path is None:
         return
@@ -431,11 +627,11 @@ def save_response_json(path: Path | None, response: dict) -> None:
     path.write_text(json.dumps(response, indent=2), encoding="utf-8")
 
 
-def print_moderation_hint(error_payload: dict) -> None:
+def moderation_hint(error_payload: dict) -> str | None:
     code = error_payload.get("code")
     details = error_payload.get("moderation_details") or {}
     if code != "moderation_blocked":
-        return
+        return None
 
     categories = details.get("categories") or []
     stage = details.get("moderation_stage")
@@ -447,37 +643,45 @@ def print_moderation_hint(error_payload: dict) -> None:
     elif stage == "output":
         hint = "The generated result was blocked. Keep the concept but change the phrasing."
 
-    print(hint, file=sys.stderr)
+    return hint
 
 
-def fail_http_error(error: urllib.error.HTTPError) -> int:
+def format_http_error(provider: str, error: urllib.error.HTTPError) -> str:
+    label = provider_label(provider)
     raw = error.read().decode("utf-8", errors="replace")
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
-        print(f"Azure OpenAI request failed: HTTP {error.code}", file=sys.stderr)
-        print(raw, file=sys.stderr)
-        return 1
+        return f"{label} request failed: HTTP {error.code}\n{raw}"
 
     err = parsed.get("error") if isinstance(parsed, dict) else None
     if not isinstance(err, dict):
-        print(f"Azure OpenAI request failed: HTTP {error.code}", file=sys.stderr)
-        print(raw, file=sys.stderr)
-        return 1
+        return f"{label} request failed: HTTP {error.code}\n{raw}"
 
-    print(f"Azure OpenAI request failed: {err.get('message', 'unknown error')}", file=sys.stderr)
+    lines = [f"{label} request failed: {err.get('message', 'unknown error')}"]
     if err.get("code"):
-        print(f"code: {err['code']}", file=sys.stderr)
-    print_moderation_hint(err)
-    return 1
+        lines.append(f"code: {err['code']}")
+    hint = moderation_hint(err)
+    if hint:
+        lines.append(hint)
+    return "\n".join(lines)
 
 
-def require_api_key(args: argparse.Namespace) -> str:
+def require_openai_api_key(args: argparse.Namespace) -> str:
+    api_key = args.api_key or os.getenv(OPENAI_API_KEY_ENV)
+    if not api_key:
+        raise ValueError(
+            "OpenAI-compatible API key is not set. "
+            "Pass --api-key or export OPENAI_API_KEY."
+        )
+    return api_key
+
+
+def require_azure_api_key(args: argparse.Namespace) -> str:
     api_key = (
         args.api_key
         or os.getenv(AZURE_API_KEY_ENV)
         or os.getenv(LEGACY_AZURE_API_KEY_ENV)
-        or os.getenv(OPENAI_API_KEY_ENV)
     )
     if not api_key:
         raise ValueError(
@@ -486,92 +690,166 @@ def require_api_key(args: argparse.Namespace) -> str:
     return api_key
 
 
+def require_provider_api_key(args: argparse.Namespace, provider: str) -> str:
+    if provider == PROVIDER_OPENAI:
+        return require_openai_api_key(args)
+    return require_azure_api_key(args)
+
+
 def require_files_exist(paths: list[Path]) -> None:
     missing = [str(path) for path in paths if not path.exists()]
     if missing:
         raise ValueError("Missing input files: " + ", ".join(missing))
 
 
+def print_saved_paths(saved_paths: list[Path]) -> None:
+    for path in saved_paths:
+        print(path)
+
+
+def run_provider_attempts(
+    providers: list[str],
+    attempt: Callable[[str], list[Path]],
+) -> int:
+    errors: list[str] = []
+    for index, provider in enumerate(providers):
+        try:
+            saved = attempt(provider)
+        except ProviderRequestError as error:
+            errors.append(str(error))
+            if index + 1 < len(providers):
+                next_provider = providers[index + 1]
+                print(
+                    f"{provider_label(provider)} request failed; "
+                    f"falling back to {provider_label(next_provider)}.",
+                    file=sys.stderr,
+                )
+                continue
+
+            for message in errors:
+                print(message, file=sys.stderr)
+            return 1
+        except Exception as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+
+        print_saved_paths(saved)
+        return 0
+
+    return 1
+
+
+def build_dry_run_preview(
+    provider: str,
+    args: argparse.Namespace,
+    operation: str,
+    content_type: str,
+    output_paths: list[Path],
+    payload: dict | None = None,
+    fields: list[tuple[str, str]] | None = None,
+    files: list[tuple[str, Path]] | None = None,
+) -> dict:
+    preview = {
+        "provider": provider,
+        "method": "POST",
+        "url": build_provider_url(provider, args, operation),
+        "headers": {
+            "Content-Type": content_type,
+            "Authorization": "Bearer ***",
+        },
+        "output_paths": [str(path) for path in output_paths],
+    }
+    if payload is not None:
+        preview["payload"] = payload
+    if fields is not None:
+        preview["fields"] = fields
+    if files is not None:
+        preview["files"] = [
+            {"field": field_name, "path": str(path)}
+            for field_name, path in files
+        ]
+    return preview
+
+
 def handle_generate(args: argparse.Namespace, prompt: str) -> int:
-    payload = generation_payload(prompt, args)
     output_paths = build_output_paths(args.output, args.output_format, args.n)
     try:
-        endpoint_root = resolve_endpoint_root(args)
+        providers = select_providers(args, for_dry_run=args.dry_run)
     except Exception as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    url = build_url(endpoint_root, "generations", args.api_version)
 
     if args.dry_run:
+        provider = providers[0]
+        payload = generation_payload(prompt, args, provider)
         preview = {
-            "method": "POST",
-            "url": url,
-            "headers": {
-                "Content-Type": "application/json",
-                "Authorization": "Bearer ***",
-            },
-            "payload": payload,
-            "output_paths": [str(path) for path in output_paths],
+            **build_dry_run_preview(
+                provider,
+                args,
+                "generations",
+                "application/json",
+                output_paths,
+                payload=payload,
+            ),
+            "fallback_providers": providers[1:],
         }
         print(json.dumps(preview, indent=2))
         return 0
 
-    try:
-        api_key = require_api_key(args)
-        response = json_request(url, payload, api_key, args.timeout)
+    def attempt(provider: str) -> list[Path]:
+        payload = generation_payload(prompt, args, provider)
+        url = build_provider_url(provider, args, "generations")
+        api_key = require_provider_api_key(args, provider)
+        response = json_request(provider, url, payload, api_key, args.timeout)
         save_response_json(args.response_json, response)
-        saved = save_images(response, output_paths)
-    except urllib.error.HTTPError as error:
-        return fail_http_error(error)
-    except Exception as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
+        return save_provider_images(provider, response, output_paths)
 
-    for path in saved:
-        print(path)
-    return 0
+    return run_provider_attempts(providers, attempt)
 
 
 def handle_edit(args: argparse.Namespace, prompt: str) -> int:
-    fields, files = edit_fields(prompt, args)
     output_paths = build_output_paths(args.output, args.output_format, args.n)
     try:
-        endpoint_root = resolve_endpoint_root(args)
+        providers = select_providers(args, for_dry_run=args.dry_run)
     except Exception as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    url = build_url(endpoint_root, "edits", args.api_version)
 
     if args.dry_run:
+        provider = providers[0]
+        fields, files = edit_fields(prompt, args, provider)
         preview = {
-            "method": "POST",
-            "url": url,
-            "headers": {
-                "Content-Type": "multipart/form-data",
-                "Authorization": "Bearer ***",
-            },
-            "fields": fields,
-            "files": [str(path) for _, path in files],
-            "output_paths": [str(path) for path in output_paths],
+            **build_dry_run_preview(
+                provider,
+                args,
+                "edits",
+                "multipart/form-data",
+                output_paths,
+                fields=fields,
+                files=files,
+            ),
+            "fallback_providers": providers[1:],
         }
         print(json.dumps(preview, indent=2))
         return 0
 
     try:
-        api_key = require_api_key(args)
-        require_files_exist([path for _, path in files])
-        response = multipart_request(url, fields, files, api_key, args.timeout)
-        save_response_json(args.response_json, response)
-        saved = save_images(response, output_paths)
-    except urllib.error.HTTPError as error:
-        return fail_http_error(error)
+        input_paths = args.image + ([args.mask] if args.mask is not None else [])
+        require_files_exist(input_paths)
     except Exception as exc:
         print(str(exc), file=sys.stderr)
         return 1
 
-    for path in saved:
-        print(path)
-    return 0
+    def attempt(provider: str) -> list[Path]:
+        fields, files = edit_fields(prompt, args, provider)
+        url = build_provider_url(provider, args, "edits")
+        api_key = require_provider_api_key(args, provider)
+        require_files_exist([path for _, path in files])
+        response = multipart_request(provider, url, fields, files, api_key, args.timeout)
+        save_response_json(args.response_json, response)
+        return save_provider_images(provider, response, output_paths)
+
+    return run_provider_attempts(providers, attempt)
 
 
 def main() -> int:

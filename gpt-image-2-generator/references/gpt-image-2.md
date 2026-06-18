@@ -2,6 +2,25 @@
 
 Use this file only when exact API behavior matters.
 
+## Provider selection
+
+- `--provider auto` tries OpenAI-compatible first when `OPENAI_API_KEY` is set.
+- If OpenAI-compatible is not configured or a live request fails, Azure OpenAI is tried when Azure key and endpoint variables are configured.
+- `--provider openai` and `--provider azure` force one provider and do not fall back.
+- Dry runs show the selected provider and fallback list without requiring an API key for endpoint-shape validation.
+
+## OpenAI-compatible configuration
+
+- base URL defaults to `https://api.openai.com/v1`, or read from:
+  - `OPENAI_BASE_URL`
+  - `--base-url`
+- model defaults to `gpt-image-2`, or read from:
+  - `OPENAI_IMAGE_MODEL`
+  - `--model`
+- auth header uses `Authorization: Bearer $OPENAI_API_KEY`
+
+The bundled script appends the `/images/*` path suffix itself. Set `OPENAI_BASE_URL` to the /v1 root, not to an `/images/*` endpoint.
+
 ## Azure deployment configuration
 
 - deployment root is read from `AZURE_OPENAI_ENDPOINT_ROOT`, or built from:
@@ -14,9 +33,13 @@ The bundled script appends the `/images/*` path suffix itself. Do not commit rea
 
 ## Endpoints used by the script
 
-- generate:
+- OpenAI-compatible generate:
+  - `POST {base-url}/images/generations`
+- OpenAI-compatible edit:
+  - `POST {base-url}/images/edits`
+- Azure generate:
   - `POST {deployment-root}/images/generations?api-version=2025-04-01-preview`
-- edit:
+- Azure edit:
   - `POST {deployment-root}/images/edits?api-version=2025-04-01-preview`
 
 ## Compatibility note
@@ -29,9 +52,19 @@ The bundled script appends the `/images/*` path suffix itself. Do not commit rea
   - editing with a mask
 - Use `2025-04-01-preview` or later for edits on Azure `gpt-image-2` deployments.
 
-## Azure example mapping
+## Request mapping
 
-Generate request body:
+OpenAI-compatible generate request body:
+
+- `model`
+- `prompt`
+- `size`
+- `quality`
+- `output_compression`
+- `output_format`
+- `n`
+
+Azure generate request body:
 
 - `prompt`
 - `size`
@@ -40,7 +73,14 @@ Generate request body:
 - `output_format`
 - `n`
 
-Edit multipart form:
+OpenAI-compatible edit multipart form:
+
+- `image[]=@...`
+- optional `mask=@...`
+- `model=...`
+- `prompt=...`
+
+Azure edit multipart form:
 
 - `image=@...`
 - optional `mask=@...`
@@ -57,7 +97,7 @@ The script mirrors those request shapes.
 - OpenAI image generation guide:
   - `https://developers.openai.com/api/docs/guides/image-generation`
 
-Checked against the official Microsoft Learn and OpenAI developer docs on `2026-06-12`.
+Checked against the official Microsoft Learn and OpenAI developer docs on `2026-06-18`.
 
 ## Response shape
 
@@ -92,14 +132,16 @@ The API returns base64 image data in `data[].b64_json`, which the script decodes
 
 If the user wants generation from reference images, image edits, or masked replacement:
 
-- Use the Azure edit endpoint shape used in this skill:
-  - `POST {deployment-root}/images/edits?api-version=2025-04-01-preview`
+- Use the provider edit endpoint shape used in this skill:
+  - OpenAI-compatible: `POST {base-url}/images/edits`
+  - Azure: `POST {deployment-root}/images/edits?api-version=2025-04-01-preview`
 - The official guides show:
   - editing an existing image
   - using multiple input images as references
   - editing with a mask
 - This skill currently implements:
-  - one or more `image` parts
+  - one or more `image[]` parts for OpenAI-compatible calls
+  - one or more `image` parts for Azure calls
   - optional `mask`
   - prompt-driven edits
 

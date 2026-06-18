@@ -4,14 +4,14 @@
 
 This repository contains skills for Codex and other agent-style coding assistants.
 The current skill is `gpt-image-2-generator`, which helps an agent turn image
-requests into structured prompts and call an Azure OpenAI `gpt-image-2`
-deployment for image generation or editing.
+requests into structured prompts and call an OpenAI-compatible /v1 Images API
+or Azure OpenAI `gpt-image-2` deployment for image generation or editing.
 
 ## Available Skills
 
 | Skill | Purpose |
 | --- | --- |
-| `gpt-image-2-generator` | Generate or edit images with Azure OpenAI `gpt-image-2`, including prompt shaping, parameter selection, dry runs, and local output handling. |
+| `gpt-image-2-generator` | Generate or edit images with OpenAI-compatible /v1 or Azure OpenAI `gpt-image-2` APIs, including prompt shaping, provider fallback, parameter selection, dry runs, and local output handling. |
 
 ## Repository Layout
 
@@ -46,12 +46,28 @@ Use $gpt-image-2-generator to generate a product image for a matte black desk la
 ```
 
 Codex will read `gpt-image-2-generator/SKILL.md`, build a visual brief, choose
-reasonable `gpt-image-2` parameters, and run the helper script when a live Azure
+reasonable `gpt-image-2` parameters, and run the helper script when a live API
 call is needed.
 
-## Azure Configuration
+## Provider Configuration
 
-Configure credentials locally before making live API calls:
+By default, the helper script tries OpenAI-compatible /v1 first when
+`OPENAI_API_KEY` is set. If that provider is not configured or the live request
+fails, it falls back to Azure when Azure credentials and endpoint settings are
+present.
+
+Configure OpenAI-compatible credentials locally before making live API calls:
+
+```powershell
+$env:OPENAI_API_KEY = "<your-api-key>"
+$env:OPENAI_BASE_URL = "https://api.openai.com/v1"
+$env:OPENAI_IMAGE_MODEL = "gpt-image-2"
+```
+
+`OPENAI_BASE_URL` and `OPENAI_IMAGE_MODEL` are optional. Set `OPENAI_BASE_URL`
+to a custom `/v1` root for OpenAI-compatible gateways.
+
+Configure Azure as the fallback provider:
 
 ```powershell
 $env:AZURE_OPENAI_API_KEY = "<your-api-key>"
@@ -71,7 +87,7 @@ Optional:
 $env:AZURE_OPENAI_API_VERSION = "2025-04-01-preview"
 ```
 
-Do not commit real Azure endpoints, deployment names, or API keys.
+Do not commit real endpoints, deployment names, model names, or API keys.
 
 ## Helper Script
 
@@ -96,10 +112,25 @@ python .\gpt-image-2-generator\scripts\generate_image.py edit `
   --output .\outputs\edited.png
 ```
 
-Validate a request without calling Azure:
+Validate an OpenAI-compatible request without calling the API:
 
 ```powershell
 python .\gpt-image-2-generator\scripts\generate_image.py generate `
+  --provider openai `
+  --base-url "https://api.example.test/v1" `
+  --model "gpt-image-2" `
+  --prompt "Minimal poster for a robotics workshop" `
+  --output .\outputs\poster.jpeg `
+  --format jpeg `
+  --quality medium `
+  --dry-run
+```
+
+Validate an Azure request without calling the API:
+
+```powershell
+python .\gpt-image-2-generator\scripts\generate_image.py generate `
+  --provider azure `
   --endpoint-root "https://example.openai.azure.com/openai/deployments/gpt-image-2" `
   --prompt "Minimal poster for a robotics workshop" `
   --output .\outputs\poster.jpeg `
@@ -125,7 +156,8 @@ validates image size constraints before sending requests.
 
 - `SKILL.md` defines when the agent should use the skill and the recommended
   workflow.
-- `scripts/generate_image.py` performs the Azure OpenAI Images API calls.
+- `scripts/generate_image.py` performs the OpenAI-compatible and Azure OpenAI
+  Images API calls.
 - `references/gpt-image-2.md` contains endpoint details, parameter constraints,
   and editing guidance for the agent to consult when exact behavior matters.
 - `agents/openai.yaml` provides display metadata for OpenAI agent surfaces.
